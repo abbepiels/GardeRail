@@ -120,6 +120,47 @@ class MenuItem(BaseModel):
     modifiers: List[MenuModifier]
 
 
+class Ingredient(BaseModel):
+    ingredient_id: str
+    name: str
+    default_allergens: Optional[Dict[Allergen, AllergenState]] = None
+
+
+class VendorProduct(BaseModel):
+    vendor_product_id: str
+    ingredient_id: str
+    upc: Optional[str] = None
+    gtin: Optional[str] = None
+    vendor_name: Optional[str] = None
+
+
+class RecipeLine(BaseModel):
+    ingredient_id: str
+    qty: Optional[float] = None
+    unit: Optional[str] = None
+
+
+class Recipe(BaseModel):
+    menu_item_id: str
+    lines: List[RecipeLine]
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ModifierAction(str, Enum):
+    ADD = "ADD"
+    REMOVE = "REMOVE"
+    REPLACE = "REPLACE"
+
+
+class ModifierRule(BaseModel):
+    menu_item_id: str
+    modifier_name: str
+    option_value: str
+    action: ModifierAction
+    ingredient_id: str
+    replace_ingredient_id: Optional[str] = None
+
+
 class VerifyCartItem(BaseModel):
     item_id: str
     qty: int = Field(ge=1, default=1)
@@ -154,6 +195,8 @@ class MappingRuleTrace(BaseModel):
     rule: str
     matched: bool
     added_skus: List[str]
+    removed_skus: List[str] = Field(default_factory=list)
+    replaced_skus: List[str] = Field(default_factory=list)
     details: Optional[Dict[str, str]] = None
 
 
@@ -227,6 +270,28 @@ class ActiveProduct(BaseModel):
 class InventoryActiveResponse(BaseModel):
     location_id: str
     active: List[ActiveProduct]
+
+
+class ToastMenuImportRequest(BaseModel):
+    items: List[MenuItem]
+
+
+class XtraChefIngredientsImportRequest(BaseModel):
+    ingredients: List[Ingredient]
+    vendor_products: List[VendorProduct] = Field(default_factory=list)
+
+
+class XtraChefRecipesImportRequest(BaseModel):
+    recipes: List[Recipe]
+
+
+class IntegrationStatusResponse(BaseModel):
+    menu_count: int
+    recipe_count: int
+    ingredient_count: int
+    vendor_product_count: int
+    modifier_rule_count: int
+    last_imports: Dict[str, Optional[datetime]]
 
 
 class ExternalProductRecord(BaseModel):
@@ -861,8 +926,26 @@ def list_active_products(location_id: str) -> List[ActiveProduct]:
     return items
 
 
-menu_items = [
-    MenuItem(
+menu_store: Dict[str, MenuItem] = {}
+ingredient_store: Dict[str, Ingredient] = {}
+vendor_product_store: Dict[str, VendorProduct] = {}
+recipe_store: Dict[str, Recipe] = {}
+modifier_rule_store: List[ModifierRule] = []
+last_imported: Dict[str, Optional[datetime]] = {
+    "menu": None,
+    "ingredients": None,
+    "vendor_products": None,
+    "recipes": None,
+    "modifier_rules": None,
+}
+
+
+def record_import(store_name: str):
+    last_imported[store_name] = utcnow()
+
+
+def seed_menu():
+    menu_store["chicken_burrito"] = MenuItem(
         item_id="chicken_burrito",
         name="Chicken Burrito",
         modifiers=[
@@ -892,70 +975,170 @@ menu_items = [
             ),
         ],
     )
-]
+    record_import("menu")
+
+
+def seed_ingredients():
+    seeds = [
+        Ingredient(ingredient_id="CHICKEN", name="Chicken"),
+        Ingredient(ingredient_id="TORTILLA_FLOUR", name="Flour Tortilla"),
+        Ingredient(ingredient_id="TORTILLA_CORN", name="Corn Tortilla"),
+        Ingredient(ingredient_id="CHEESE", name="Cheese"),
+        Ingredient(ingredient_id="MAYO", name="Chipotle Mayo"),
+    ]
+    for ing in seeds:
+        ingredient_store[ing.ingredient_id] = ing
+    record_import("ingredients")
+
+
+def seed_recipes():
+    recipe_store["chicken_burrito"] = Recipe(
+        menu_item_id="chicken_burrito",
+        lines=[
+            RecipeLine(ingredient_id="CHICKEN"),
+            RecipeLine(ingredient_id="TORTILLA_FLOUR"),
+            RecipeLine(ingredient_id="CHEESE"),
+        ],
+        updated_at=utcnow(),
+    )
+    record_import("recipes")
+
+
+def seed_modifier_rules():
+    modifier_rule_store.clear()
+    modifier_rule_store.extend(
+        [
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="tortilla",
+                option_value="flour",
+                action=ModifierAction.REPLACE,
+                ingredient_id="TORTILLA_FLOUR",
+                replace_ingredient_id="TORTILLA_CORN",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="tortilla",
+                option_value="corn",
+                action=ModifierAction.REPLACE,
+                ingredient_id="TORTILLA_CORN",
+                replace_ingredient_id="TORTILLA_FLOUR",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="cheese",
+                option_value="yes",
+                action=ModifierAction.ADD,
+                ingredient_id="CHEESE",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="cheese",
+                option_value="no",
+                action=ModifierAction.REMOVE,
+                ingredient_id="CHEESE",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="sauce",
+                option_value="chipotle_mayo",
+                action=ModifierAction.ADD,
+                ingredient_id="MAYO",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="sauce",
+                option_value="none",
+                action=ModifierAction.REMOVE,
+                ingredient_id="MAYO",
+            ),
+        ]
+    )
+    record_import("modifier_rules")
+
+
+def seed_data():
+    seed_menu()
+    seed_ingredients()
+    seed_recipes()
+    seed_modifier_rules()
 
 
 def get_menu_item(item_id: str) -> Optional[MenuItem]:
-    for item in menu_items:
-        if item.item_id == item_id:
-            return item
-    return None
+    return menu_store.get(item_id)
 
 
-def resolve_recipe(cart_item: VerifyCartItem) -> ItemMappingTrace:
-    base_ingredients = ["CHICKEN"]
+def get_effective_modifiers(cart_item: VerifyCartItem, menu_item: Optional[MenuItem]) -> Dict[str, str]:
+    effective: Dict[str, str] = {}
+    if menu_item:
+        for mod in menu_item.modifiers:
+            if mod.default is not None:
+                effective[mod.name] = mod.default
+    for key, value in cart_item.modifiers.items():
+        effective[key] = value
+    return effective
+
+
+def resolve_recipe_from_stores(cart_item: VerifyCartItem) -> Tuple[ItemMappingTrace, Optional[str]]:
+    menu_item = get_menu_item(cart_item.item_id)
+    effective_modifiers = get_effective_modifiers(cart_item, menu_item)
+
+    recipe = recipe_store.get(cart_item.item_id)
+    if not recipe:
+        trace = ItemMappingTrace(item_id=cart_item.item_id, base_ingredients=[], matched_rules=[], final_base_ingredients=[])
+        return trace, "no recipe mapping"
+
+    base_ingredients = [line.ingredient_id for line in recipe.lines]
     final_base_ingredients = list(base_ingredients)
     matched_rules: List[MappingRuleTrace] = []
 
-    rules = [
-        {
-            "name": "tortilla_flour",
-            "priority": 100,
-            "condition": lambda mods: mods.get("tortilla") == "flour",
-            "base_ingredients": ["TORTILLA_FLOUR"],
-        },
-        {
-            "name": "tortilla_corn",
-            "priority": 90,
-            "condition": lambda mods: mods.get("tortilla") == "corn",
-            "base_ingredients": ["TORTILLA_CORN"],
-        },
-        {
-            "name": "cheese_yes",
-            "priority": 80,
-            "condition": lambda mods: mods.get("cheese", "yes") == "yes",
-            "base_ingredients": ["CHEESE"],
-        },
-        {
-            "name": "sauce_chipotle_mayo",
-            "priority": 70,
-            "condition": lambda mods: mods.get("sauce") == "chipotle_mayo",
-            "base_ingredients": ["MAYO"],
-        },
-    ]
-
-    for rule in sorted(rules, key=lambda r: r["priority"], reverse=True):
-        matched = bool(rule["condition"](cart_item.modifiers))
-        added = rule["base_ingredients"] if matched else []
+    rules = [rule for rule in modifier_rule_store if rule.menu_item_id == cart_item.item_id]
+    for rule in rules:
+        option = effective_modifiers.get(rule.modifier_name)
+        matched = option == rule.option_value
+        added: List[str] = []
+        removed: List[str] = []
+        replaced: List[str] = []
         if matched:
-            final_base_ingredients.extend(added)
+            if rule.action == ModifierAction.ADD:
+                if rule.ingredient_id not in final_base_ingredients:
+                    final_base_ingredients.append(rule.ingredient_id)
+                    added.append(rule.ingredient_id)
+            elif rule.action == ModifierAction.REMOVE:
+                while rule.ingredient_id in final_base_ingredients:
+                    final_base_ingredients.remove(rule.ingredient_id)
+                    removed.append(rule.ingredient_id)
+            elif rule.action == ModifierAction.REPLACE:
+                if rule.replace_ingredient_id:
+                    while rule.replace_ingredient_id in final_base_ingredients:
+                        final_base_ingredients.remove(rule.replace_ingredient_id)
+                        replaced.append(rule.replace_ingredient_id)
+                if rule.ingredient_id not in final_base_ingredients:
+                    final_base_ingredients.append(rule.ingredient_id)
+                    added.append(rule.ingredient_id)
+
         matched_rules.append(
             MappingRuleTrace(
-                rule=rule["name"],
+                rule=f"{rule.modifier_name}={rule.option_value}",
                 matched=matched,
                 added_skus=added,
-                details={"priority": str(rule["priority"])}
-                if matched
-                else {"priority": str(rule["priority"])},
+                removed_skus=removed,
+                replaced_skus=replaced,
+                details={"action": rule.action.value, "ingredient_id": rule.ingredient_id},
             )
         )
 
-    return ItemMappingTrace(
+    trace = ItemMappingTrace(
         item_id=cart_item.item_id,
         base_ingredients=base_ingredients,
         matched_rules=matched_rules,
         final_base_ingredients=final_base_ingredients,
     )
+    return trace, None
+
+
+# Seed demo data on startup.
+seed_data()
 
 
 def is_stale_timestamp(ts: Optional[datetime]) -> bool:
@@ -984,7 +1167,54 @@ def get_distributor_product(sku: str = Path(..., description="SKU identifier")):
 
 @app.get("/v1/menu", response_model=List[MenuItem])
 def get_menu():
-    return menu_items
+    return list(menu_store.values())
+
+
+@app.post("/v1/integrations/toast/menu/import")
+def import_toast_menu(payload: ToastMenuImportRequest):
+    menu_store.clear()
+    for item in payload.items:
+        menu_store[item.item_id] = item
+    record_import("menu")
+    return {"ok": True, "menu_count": len(menu_store)}
+
+
+@app.post("/v1/integrations/xtrachef/ingredients/import")
+def import_xtrachef_ingredients(payload: XtraChefIngredientsImportRequest):
+    ingredient_store.clear()
+    vendor_product_store.clear()
+    for ing in payload.ingredients:
+        ingredient_store[ing.ingredient_id] = ing
+    for vp in payload.vendor_products:
+        vendor_product_store[vp.vendor_product_id] = vp
+    record_import("ingredients")
+    record_import("vendor_products")
+    return {
+        "ok": True,
+        "ingredient_count": len(ingredient_store),
+        "vendor_product_count": len(vendor_product_store),
+    }
+
+
+@app.post("/v1/integrations/xtrachef/recipes/import")
+def import_xtrachef_recipes(payload: XtraChefRecipesImportRequest):
+    recipe_store.clear()
+    for recipe in payload.recipes:
+        recipe_store[recipe.menu_item_id] = recipe
+    record_import("recipes")
+    return {"ok": True, "recipe_count": len(recipe_store)}
+
+
+@app.get("/v1/integrations/status", response_model=IntegrationStatusResponse)
+def integrations_status():
+    return IntegrationStatusResponse(
+        menu_count=len(menu_store),
+        recipe_count=len(recipe_store),
+        ingredient_count=len(ingredient_store),
+        vendor_product_count=len(vendor_product_store),
+        modifier_rule_count=len(modifier_rule_store),
+        last_imports=last_imported,
+    )
 
 
 @app.get("/v1/providers")
@@ -1080,12 +1310,41 @@ def verify(request: VerifyRequest):
     for item in request.cart:
         menu_item = get_menu_item(item.item_id)
         if not menu_item:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown menu item {item.item_id}")
+            trace = ItemMappingTrace(item_id=item.item_id, base_ingredients=[], matched_rules=[], final_base_ingredients=[])
+            mapping_traces.append(trace)
+            base_ingredients_used[item.item_id] = []
+            active_product_links[item.item_id] = {}
+            if decision != VerificationDecision.UNSAFE:
+                decision = VerificationDecision.UNKNOWN
+            reasons.append(
+                Reason(
+                    allergen=request.allergies[0] if request.allergies else Allergen.WHEAT,
+                    ingredient_sku=item.item_id,
+                    ingredient_name=item.item_id,
+                    state=AllergenState.UNKNOWN,
+                    explanation=f"Unknown — menu item {item.item_id} not found in menu store.",
+                )
+            )
+            continue
 
-        trace = resolve_recipe(item)
+        trace, mapping_issue = resolve_recipe_from_stores(item)
         mapping_traces.append(trace)
         base_ingredients_used[item.item_id] = trace.final_base_ingredients
         active_product_links[item.item_id] = {}
+
+        if mapping_issue:
+            if decision != VerificationDecision.UNSAFE:
+                decision = VerificationDecision.UNKNOWN
+            reasons.append(
+                Reason(
+                    allergen=request.allergies[0] if request.allergies else Allergen.WHEAT,
+                    ingredient_sku=item.item_id,
+                    ingredient_name=item.item_id,
+                    state=AllergenState.UNKNOWN,
+                    explanation=f"Unknown — {mapping_issue} for menu item {item.item_id}.",
+                )
+            )
+            continue
 
         for base_id in trace.final_base_ingredients:
             active = get_active_product(request.location_id, base_id)
