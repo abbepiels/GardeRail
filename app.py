@@ -18,6 +18,7 @@
 # 3) Switch tortilla to corn (scan above already set) and verify safe:
 # curl -X POST http://localhost:8000/v1/verify -H "Content-Type: application/json" \
 #  -d '{"user_id":"u1","location_id":"store_1","allergies":["WHEAT"],"cart":[{"item_id":"chicken_burrito","qty":1,"modifiers":{"tortilla":"corn","cheese":"no","sauce":"none"}}]}'
+# Sanity (taxonomy trusted): corn tortilla + no cheese/sauce is SAFE for WHEAT once scanned; flour tortilla stays UNSAFE due to WHEAT_FLOUR.
 # Lookup a UPC via public providers:
 # curl http://localhost:8000/v1/lookup/upc/048001214101
 # List provider readiness:
@@ -124,6 +125,7 @@ class Ingredient(BaseModel):
     ingredient_id: str
     name: str
     default_allergens: Optional[Dict[Allergen, AllergenState]] = None
+    taxonomy_trusted: bool = False
 
 
 class IngredientComponentLine(BaseModel):
@@ -1028,9 +1030,9 @@ def seed_ingredients():
         Ingredient(ingredient_id="CHEESE", name="Cheese", default_allergens={Allergen.WHEAT: AllergenState.NOT_PRESENT}),
         Ingredient(ingredient_id="MAYO", name="Chipotle Mayo", default_allergens={Allergen.WHEAT: AllergenState.NOT_PRESENT}),
         Ingredient(ingredient_id="WHEAT_FLOUR", name="Wheat Flour", default_allergens={Allergen.WHEAT: AllergenState.CONTAINS}),
-        Ingredient(ingredient_id="WATER", name="Water", default_allergens={}),
-        Ingredient(ingredient_id="OIL", name="Oil", default_allergens={}),
-        Ingredient(ingredient_id="SALT", name="Salt", default_allergens={}),
+        Ingredient(ingredient_id="WATER", name="Water", default_allergens={}, taxonomy_trusted=True),
+        Ingredient(ingredient_id="OIL", name="Oil", default_allergens={}, taxonomy_trusted=True),
+        Ingredient(ingredient_id="SALT", name="Salt", default_allergens={}, taxonomy_trusted=True),
         Ingredient(ingredient_id="CORN_FLOUR", name="Corn Flour", default_allergens={Allergen.WHEAT: AllergenState.NOT_PRESENT}),
         Ingredient(ingredient_id="EGG_YOLK", name="Egg Yolk", default_allergens={Allergen.EGG: AllergenState.CONTAINS}),
     ]
@@ -1218,6 +1220,12 @@ def resolve_recipe_from_stores(cart_item: VerifyCartItem) -> Tuple[ItemMappingTr
         final_base_ingredients=final_base_ingredients,
     )
     return trace, None
+
+
+def taxonomy_state(ingredient: Ingredient, allergen: Allergen, profile: Dict[Allergen, AllergenState]) -> AllergenState:
+    """Trusted taxonomy defaults missing allergens to NOT_PRESENT; else UNKNOWN."""
+    default_state = AllergenState.NOT_PRESENT if ingredient.taxonomy_trusted else AllergenState.UNKNOWN
+    return profile.get(allergen, default_state)
 
 
 def expand_ingredient_ids(base_ids: List[str]) -> Tuple[List[str], List[CompositionRuleTrace], List[Tuple[str, str]], bool]:
@@ -1659,6 +1667,7 @@ def verify(request: VerifyRequest):
             provider_fetched_at: Optional[datetime] = None
             ingredient_sku = leaf_id
             ingredient_name = leaf_id
+            ingredient = ingredient_store.get(leaf_id)
 
             base_info = base_profiles.get(source_base)
             if base_info and base_info.get("source") == "supplier" and base_info.get("profile") is not None:
@@ -1669,7 +1678,6 @@ def verify(request: VerifyRequest):
                 ingredient_sku = truth_obj.gtin
                 ingredient_name = f"{truth_obj.name} ({leaf_id})"
             else:
-                ingredient = ingredient_store.get(leaf_id)
                 default_profile = ingredient.default_allergens if ingredient else None
                 if default_profile is not None:
                     profile = default_profile
@@ -1696,7 +1704,10 @@ def verify(request: VerifyRequest):
                 continue
 
             for allergen in request.allergies:
-                state = profile.get(allergen, AllergenState.UNKNOWN)
+                if provider_name == "DEFAULT_INGREDIENT" and ingredient:
+                    state = taxonomy_state(ingredient, allergen, profile)
+                else:
+                    state = profile.get(allergen, AllergenState.UNKNOWN)
                 if state == AllergenState.CONTAINS:
                     decision = VerificationDecision.UNSAFE
                     reasons.append(
