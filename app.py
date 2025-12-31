@@ -19,6 +19,7 @@
 # curl -X POST http://localhost:8000/v1/verify -H "Content-Type: application/json" \
 #  -d '{"user_id":"u1","location_id":"store_1","allergies":["WHEAT"],"cart":[{"item_id":"chicken_burrito","qty":1,"modifiers":{"tortilla":"corn","cheese":"no","sauce":"none"}}]}'
 # Sanity (taxonomy trusted): corn tortilla + no cheese/sauce is SAFE for WHEAT once scanned; flour tortilla stays UNSAFE due to WHEAT_FLOUR.
+# Milk demo: MILK allergy with cheese=yes is UNSAFE (CHEESE -> MILK), cheese=no is SAFE (assuming other data present).
 # Lookup a UPC via public providers:
 # curl http://localhost:8000/v1/lookup/upc/048001214101
 # List provider readiness:
@@ -1035,6 +1036,12 @@ def seed_ingredients():
         Ingredient(ingredient_id="SALT", name="Salt", default_allergens={}, taxonomy_trusted=True),
         Ingredient(ingredient_id="CORN_FLOUR", name="Corn Flour", default_allergens={Allergen.WHEAT: AllergenState.NOT_PRESENT}),
         Ingredient(ingredient_id="EGG_YOLK", name="Egg Yolk", default_allergens={Allergen.EGG: AllergenState.CONTAINS}),
+        Ingredient(
+            ingredient_id="MILK",
+            name="Milk",
+            default_allergens={Allergen.MILK: AllergenState.CONTAINS},
+            taxonomy_trusted=True,
+        ),
     ]
     for ing in seeds:
         ingredient_store[ing.ingredient_id] = ing
@@ -1134,6 +1141,14 @@ def seed_ingredient_compositions():
         components=[
             IngredientComponentLine(ingredient_id="EGG_YOLK"),
             IngredientComponentLine(ingredient_id="OIL"),
+            IngredientComponentLine(ingredient_id="SALT"),
+        ],
+        updated_at=now,
+    )
+    ingredient_composition_store["CHEESE"] = IngredientComposition(
+        parent_ingredient_id="CHEESE",
+        components=[
+            IngredientComponentLine(ingredient_id="MILK"),
             IngredientComponentLine(ingredient_id="SALT"),
         ],
         updated_at=now,
@@ -1456,6 +1471,11 @@ def get_ingredient_detail(ingredient_id: str):
     )
 
 
+@app.get("/v1/health")
+def health():
+    return {"ok": True, "time": utcnow().isoformat()}
+
+
 @app.post("/v1/inventory/scan", response_model=InventoryScanResponse)
 def inventory_scan(request: InventoryScanRequest):
     active = link_active_product(request.location_id, request.base_ingredient_id, request.gtin, request.lot)
@@ -1478,7 +1498,8 @@ def summarize(decision: VerificationDecision, reasons: List[Reason]) -> str:
     if decision == VerificationDecision.SAFE:
         return "SAFE — this dish does not contain declared allergens."
     if decision == VerificationDecision.UNSAFE and reasons:
-        return f"UNSAFE — {reasons[0].explanation}"
+        first_contains = next((r for r in reasons if r.state == AllergenState.CONTAINS), reasons[0])
+        return f"UNSAFE — {first_contains.explanation}"
     return "UNKNOWN — cannot guarantee safety due to stale or missing ingredient data."
 
 
@@ -1669,45 +1690,35 @@ def verify(request: VerifyRequest):
             ingredient_name = leaf_id
             ingredient = ingredient_store.get(leaf_id)
 
-            base_info = base_profiles.get(source_base)
-            if base_info and base_info.get("source") == "supplier" and base_info.get("profile") is not None:
-                profile = base_info["profile"]
-                provider_name = str(base_info["provider"])
-                provider_fetched_at = base_info["provider_fetched_at"]
-                truth_obj: SupplierProductTruth = base_info["truth"]  # type: ignore
-                ingredient_sku = truth_obj.gtin
-                ingredient_name = f"{truth_obj.name} ({leaf_id})"
-            else:
-                default_profile = ingredient.default_allergens if ingredient else None
-                if default_profile is not None:
-                    profile = default_profile
-                    provider_name = "DEFAULT_INGREDIENT"
-                    ingredient_name = ingredient.name if ingredient else leaf_id
-                else:
-                    profile = None
-                    ingredient_name = ingredient.name if ingredient else leaf_id
+            default_profile = ingredient.default_allergens if ingredient else None
+            if default_profile is not None:
+                profile = default_profile
+                provider_name = "INGREDIENT_TAXONOMY"
+                provider_fetched_at = None
+                ingredient_name = ingredient.name if ingredient else leaf_id
 
             if profile is None:
                 if decision != VerificationDecision.UNSAFE:
                     decision = VerificationDecision.UNKNOWN
-                reasons.append(
-                    Reason(
-                        allergen=request.allergies[0] if request.allergies else Allergen.WHEAT,
-                        ingredient_sku=ingredient_sku,
-                        ingredient_name=ingredient_name,
-                        state=AllergenState.UNKNOWN,
-                        explanation=f"Unknown — no allergen data for ingredient {leaf_id} derived from {source_base}.",
-                        provider=provider_name,
-                        provider_fetched_at=provider_fetched_at,
+                for allergen in request.allergies:
+                    reasons.append(
+                        Reason(
+                            allergen=allergen,
+                            ingredient_sku=ingredient_sku,
+                            ingredient_name=ingredient_name,
+                            state=AllergenState.UNKNOWN,
+                            explanation=f"Unknown — no allergen data for ingredient {leaf_id} derived from {source_base}.",
+                            provider=provider_name,
+                            provider_fetched_at=provider_fetched_at,
+                        )
                     )
-                )
                 continue
 
             for allergen in request.allergies:
-                if provider_name == "DEFAULT_INGREDIENT" and ingredient:
+                if provider_name == "INGREDIENT_TAXONOMY" and ingredient:
                     state = taxonomy_state(ingredient, allergen, profile)
                 else:
-                    state = profile.get(allergen, AllergenState.UNKNOWN)
+                    state = AllergenState.UNKNOWN if profile is None else profile.get(allergen, AllergenState.UNKNOWN)
                 if state == AllergenState.CONTAINS:
                     decision = VerificationDecision.UNSAFE
                     reasons.append(
