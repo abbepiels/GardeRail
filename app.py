@@ -18,6 +18,8 @@
 # 3) Switch tortilla to corn (scan above already set) and verify safe:
 # curl -X POST http://localhost:8000/v1/verify -H "Content-Type: application/json" \
 #  -d '{"user_id":"u1","location_id":"store_1","allergies":["WHEAT"],"cart":[{"item_id":"chicken_burrito","qty":1,"modifiers":{"tortilla":"corn","cheese":"no","sauce":"none"}}]}'
+# Sanity (taxonomy trusted): corn tortilla + no cheese/sauce is SAFE for WHEAT once scanned; flour tortilla stays UNSAFE due to WHEAT_FLOUR.
+# Milk demo: MILK allergy with cheese=yes is UNSAFE (CHEESE -> MILK), cheese=no is SAFE (assuming other data present).
 # Lookup a UPC via public providers:
 # curl http://localhost:8000/v1/lookup/upc/048001214101
 # List provider readiness:
@@ -120,6 +122,68 @@ class MenuItem(BaseModel):
     modifiers: List[MenuModifier]
 
 
+class Ingredient(BaseModel):
+    ingredient_id: str
+    name: str
+    default_allergens: Optional[Dict[Allergen, AllergenState]] = None
+    taxonomy_trusted: bool = False
+
+
+class IngredientComponentLine(BaseModel):
+    ingredient_id: str
+    qty: Optional[float] = None
+    unit: Optional[str] = None
+
+
+class IngredientComposition(BaseModel):
+    parent_ingredient_id: str
+    components: List[IngredientComponentLine]
+    updated_at: datetime
+
+
+class CompositionRuleTrace(BaseModel):
+    parent_ingredient_id: str
+    expanded_to: List[str]
+    depth: int
+    cycle_detected: bool = False
+    details: Optional[Dict[str, str]] = None
+
+
+class VendorProduct(BaseModel):
+    vendor_product_id: str
+    ingredient_id: str
+    upc: Optional[str] = None
+    gtin: Optional[str] = None
+    vendor_name: Optional[str] = None
+
+
+class RecipeLine(BaseModel):
+    ingredient_id: str
+    qty: Optional[float] = None
+    unit: Optional[str] = None
+
+
+class Recipe(BaseModel):
+    menu_item_id: str
+    lines: List[RecipeLine]
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ModifierAction(str, Enum):
+    ADD = "ADD"
+    REMOVE = "REMOVE"
+    REPLACE = "REPLACE"
+
+
+class ModifierRule(BaseModel):
+    menu_item_id: str
+    modifier_name: str
+    option_value: str
+    action: ModifierAction
+    ingredient_id: str
+    replace_ingredient_id: Optional[str] = None
+
+
 class VerifyCartItem(BaseModel):
     item_id: str
     qty: int = Field(ge=1, default=1)
@@ -154,6 +218,8 @@ class MappingRuleTrace(BaseModel):
     rule: str
     matched: bool
     added_skus: List[str]
+    removed_skus: List[str] = Field(default_factory=list)
+    replaced_skus: List[str] = Field(default_factory=list)
     details: Optional[Dict[str, str]] = None
 
 
@@ -162,6 +228,8 @@ class ItemMappingTrace(BaseModel):
     base_ingredients: List[str]
     matched_rules: List[MappingRuleTrace]
     final_base_ingredients: List[str]
+    expanded_ingredients: Optional[List[str]] = None
+    composition_trace: Optional[List[CompositionRuleTrace]] = None
 
 
 class VerifyResponse(BaseModel):
@@ -171,6 +239,7 @@ class VerifyResponse(BaseModel):
     audit_id: str
     checkout_token: str
     token_expires_at: datetime
+    mapping_trace: Optional[List[ItemMappingTrace]] = None
 
 
 class ConsentRequest(BaseModel):
@@ -229,6 +298,40 @@ class InventoryActiveResponse(BaseModel):
     active: List[ActiveProduct]
 
 
+class ToastMenuImportRequest(BaseModel):
+    items: List[MenuItem]
+
+
+class XtraChefIngredientsImportRequest(BaseModel):
+    ingredients: List[Ingredient]
+    vendor_products: List[VendorProduct] = Field(default_factory=list)
+
+
+class XtraChefRecipesImportRequest(BaseModel):
+    recipes: List[Recipe]
+
+
+class XtraChefIngredientCompositionsImportRequest(BaseModel):
+    compositions: List[IngredientComposition]
+
+
+class IntegrationStatusResponse(BaseModel):
+    menu_count: int
+    recipe_count: int
+    ingredient_count: int
+    vendor_product_count: int
+    modifier_rule_count: int
+    composition_count: int
+    last_imports: Dict[str, Optional[datetime]]
+
+
+class IngredientDetailResponse(BaseModel):
+    ingredient: Ingredient
+    composition: Optional[IngredientComposition] = None
+    expanded_leaves: Optional[List[str]] = None
+    composition_trace: Optional[List[CompositionRuleTrace]] = None
+
+
 class ExternalProductRecord(BaseModel):
     upc: str
     name: Optional[str] = None
@@ -257,6 +360,7 @@ class AuditRecord(BaseModel):
     mapping_trace: List[ItemMappingTrace]
     ingredient_versions_used: Dict[str, str]
     base_ingredients_used: Dict[str, List[str]]
+    expanded_ingredients_used: Optional[Dict[str, List[str]]] = None
     active_product_links: Dict[str, Dict[str, str]]
     cart_hash: str
     policy: Dict[str, str]
@@ -427,6 +531,7 @@ def seeded_supplier_truth() -> Dict[Tuple[str, str], SupplierProductTruth]:
             allergens={
                 Allergen.EGG: AllergenState.CONTAINS,
                 Allergen.SOY: AllergenState.MAY_CONTAIN,
+                Allergen.WHEAT: AllergenState.NOT_PRESENT,
             },
             risk_flags=["SHARED_LINE_SOY"],
             version="1.0.0",
@@ -438,7 +543,10 @@ def seeded_supplier_truth() -> Dict[Tuple[str, str], SupplierProductTruth]:
             lot="C1",
             brand="DairyCo",
             name="Shredded Cheese",
-            allergens={Allergen.MILK: AllergenState.CONTAINS},
+            allergens={
+                Allergen.MILK: AllergenState.CONTAINS,
+                Allergen.WHEAT: AllergenState.NOT_PRESENT,
+            },
             risk_flags=[],
             version="1.0.0",
             updated_at=now,
@@ -861,8 +969,28 @@ def list_active_products(location_id: str) -> List[ActiveProduct]:
     return items
 
 
-menu_items = [
-    MenuItem(
+menu_store: Dict[str, MenuItem] = {}
+ingredient_store: Dict[str, Ingredient] = {}
+vendor_product_store: Dict[str, VendorProduct] = {}
+recipe_store: Dict[str, Recipe] = {}
+modifier_rule_store: List[ModifierRule] = []
+ingredient_composition_store: Dict[str, IngredientComposition] = {}
+last_imported: Dict[str, Optional[datetime]] = {
+    "menu": None,
+    "ingredients": None,
+    "vendor_products": None,
+    "recipes": None,
+    "modifier_rules": None,
+    "ingredient_compositions": None,
+}
+
+
+def record_import(store_name: str):
+    last_imported[store_name] = utcnow()
+
+
+def seed_menu():
+    menu_store["chicken_burrito"] = MenuItem(
         item_id="chicken_burrito",
         name="Chicken Burrito",
         modifiers=[
@@ -892,70 +1020,300 @@ menu_items = [
             ),
         ],
     )
-]
+    record_import("menu")
+
+
+def seed_ingredients():
+    seeds = [
+        Ingredient(ingredient_id="CHICKEN", name="Chicken", default_allergens={Allergen.WHEAT: AllergenState.NOT_PRESENT}),
+        Ingredient(ingredient_id="TORTILLA_FLOUR", name="Flour Tortilla"),
+        Ingredient(ingredient_id="TORTILLA_CORN", name="Corn Tortilla"),
+        Ingredient(ingredient_id="CHEESE", name="Cheese", default_allergens={Allergen.WHEAT: AllergenState.NOT_PRESENT}),
+        Ingredient(ingredient_id="MAYO", name="Chipotle Mayo", default_allergens={Allergen.WHEAT: AllergenState.NOT_PRESENT}),
+        Ingredient(ingredient_id="WHEAT_FLOUR", name="Wheat Flour", default_allergens={Allergen.WHEAT: AllergenState.CONTAINS}),
+        Ingredient(ingredient_id="WATER", name="Water", default_allergens={}, taxonomy_trusted=True),
+        Ingredient(ingredient_id="OIL", name="Oil", default_allergens={}, taxonomy_trusted=True),
+        Ingredient(ingredient_id="SALT", name="Salt", default_allergens={}, taxonomy_trusted=True),
+        Ingredient(ingredient_id="CORN_FLOUR", name="Corn Flour", default_allergens={Allergen.WHEAT: AllergenState.NOT_PRESENT}),
+        Ingredient(ingredient_id="EGG_YOLK", name="Egg Yolk", default_allergens={Allergen.EGG: AllergenState.CONTAINS}),
+        Ingredient(
+            ingredient_id="MILK",
+            name="Milk",
+            default_allergens={Allergen.MILK: AllergenState.CONTAINS},
+            taxonomy_trusted=True,
+        ),
+    ]
+    for ing in seeds:
+        ingredient_store[ing.ingredient_id] = ing
+    record_import("ingredients")
+
+
+def seed_recipes():
+    recipe_store["chicken_burrito"] = Recipe(
+        menu_item_id="chicken_burrito",
+        lines=[
+            RecipeLine(ingredient_id="CHICKEN"),
+            RecipeLine(ingredient_id="TORTILLA_FLOUR"),
+            RecipeLine(ingredient_id="CHEESE"),
+        ],
+        updated_at=utcnow(),
+    )
+    record_import("recipes")
+
+
+def seed_modifier_rules():
+    modifier_rule_store.clear()
+    modifier_rule_store.extend(
+        [
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="tortilla",
+                option_value="flour",
+                action=ModifierAction.REPLACE,
+                ingredient_id="TORTILLA_FLOUR",
+                replace_ingredient_id="TORTILLA_CORN",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="tortilla",
+                option_value="corn",
+                action=ModifierAction.REPLACE,
+                ingredient_id="TORTILLA_CORN",
+                replace_ingredient_id="TORTILLA_FLOUR",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="cheese",
+                option_value="yes",
+                action=ModifierAction.ADD,
+                ingredient_id="CHEESE",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="cheese",
+                option_value="no",
+                action=ModifierAction.REMOVE,
+                ingredient_id="CHEESE",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="sauce",
+                option_value="chipotle_mayo",
+                action=ModifierAction.ADD,
+                ingredient_id="MAYO",
+            ),
+            ModifierRule(
+                menu_item_id="chicken_burrito",
+                modifier_name="sauce",
+                option_value="none",
+                action=ModifierAction.REMOVE,
+                ingredient_id="MAYO",
+            ),
+        ]
+    )
+    record_import("modifier_rules")
+
+
+def seed_ingredient_compositions():
+    ingredient_composition_store.clear()
+    now = utcnow()
+    ingredient_composition_store["TORTILLA_FLOUR"] = IngredientComposition(
+        parent_ingredient_id="TORTILLA_FLOUR",
+        components=[
+            IngredientComponentLine(ingredient_id="WHEAT_FLOUR"),
+            IngredientComponentLine(ingredient_id="WATER"),
+            IngredientComponentLine(ingredient_id="OIL"),
+            IngredientComponentLine(ingredient_id="SALT"),
+        ],
+        updated_at=now,
+    )
+    ingredient_composition_store["TORTILLA_CORN"] = IngredientComposition(
+        parent_ingredient_id="TORTILLA_CORN",
+        components=[
+            IngredientComponentLine(ingredient_id="CORN_FLOUR"),
+            IngredientComponentLine(ingredient_id="WATER"),
+            IngredientComponentLine(ingredient_id="SALT"),
+        ],
+        updated_at=now,
+    )
+    ingredient_composition_store["MAYO"] = IngredientComposition(
+        parent_ingredient_id="MAYO",
+        components=[
+            IngredientComponentLine(ingredient_id="EGG_YOLK"),
+            IngredientComponentLine(ingredient_id="OIL"),
+            IngredientComponentLine(ingredient_id="SALT"),
+        ],
+        updated_at=now,
+    )
+    ingredient_composition_store["CHEESE"] = IngredientComposition(
+        parent_ingredient_id="CHEESE",
+        components=[
+            IngredientComponentLine(ingredient_id="MILK"),
+            IngredientComponentLine(ingredient_id="SALT"),
+        ],
+        updated_at=now,
+    )
+    record_import("ingredient_compositions")
+
+
+def seed_data():
+    seed_menu()
+    seed_ingredients()
+    seed_recipes()
+    seed_modifier_rules()
+    seed_ingredient_compositions()
 
 
 def get_menu_item(item_id: str) -> Optional[MenuItem]:
-    for item in menu_items:
-        if item.item_id == item_id:
-            return item
-    return None
+    return menu_store.get(item_id)
 
 
-def resolve_recipe(cart_item: VerifyCartItem) -> ItemMappingTrace:
-    base_ingredients = ["CHICKEN"]
+def get_effective_modifiers(cart_item: VerifyCartItem, menu_item: Optional[MenuItem]) -> Dict[str, str]:
+    effective: Dict[str, str] = {}
+    if menu_item:
+        for mod in menu_item.modifiers:
+            if mod.default is not None:
+                effective[mod.name] = mod.default
+    for key, value in cart_item.modifiers.items():
+        effective[key] = value
+    return effective
+
+
+def resolve_recipe_from_stores(cart_item: VerifyCartItem) -> Tuple[ItemMappingTrace, Optional[str]]:
+    menu_item = get_menu_item(cart_item.item_id)
+    effective_modifiers = get_effective_modifiers(cart_item, menu_item)
+
+    recipe = recipe_store.get(cart_item.item_id)
+    if not recipe:
+        trace = ItemMappingTrace(item_id=cart_item.item_id, base_ingredients=[], matched_rules=[], final_base_ingredients=[])
+        return trace, "no recipe mapping"
+
+    base_ingredients = [line.ingredient_id for line in recipe.lines]
     final_base_ingredients = list(base_ingredients)
     matched_rules: List[MappingRuleTrace] = []
 
-    rules = [
-        {
-            "name": "tortilla_flour",
-            "priority": 100,
-            "condition": lambda mods: mods.get("tortilla") == "flour",
-            "base_ingredients": ["TORTILLA_FLOUR"],
-        },
-        {
-            "name": "tortilla_corn",
-            "priority": 90,
-            "condition": lambda mods: mods.get("tortilla") == "corn",
-            "base_ingredients": ["TORTILLA_CORN"],
-        },
-        {
-            "name": "cheese_yes",
-            "priority": 80,
-            "condition": lambda mods: mods.get("cheese", "yes") == "yes",
-            "base_ingredients": ["CHEESE"],
-        },
-        {
-            "name": "sauce_chipotle_mayo",
-            "priority": 70,
-            "condition": lambda mods: mods.get("sauce") == "chipotle_mayo",
-            "base_ingredients": ["MAYO"],
-        },
-    ]
-
-    for rule in sorted(rules, key=lambda r: r["priority"], reverse=True):
-        matched = bool(rule["condition"](cart_item.modifiers))
-        added = rule["base_ingredients"] if matched else []
+    rules = [rule for rule in modifier_rule_store if rule.menu_item_id == cart_item.item_id]
+    for rule in rules:
+        option = effective_modifiers.get(rule.modifier_name)
+        matched = option == rule.option_value
+        added: List[str] = []
+        removed: List[str] = []
+        replaced: List[str] = []
         if matched:
-            final_base_ingredients.extend(added)
+            if rule.action == ModifierAction.ADD:
+                if rule.ingredient_id not in final_base_ingredients:
+                    final_base_ingredients.append(rule.ingredient_id)
+                    added.append(rule.ingredient_id)
+            elif rule.action == ModifierAction.REMOVE:
+                while rule.ingredient_id in final_base_ingredients:
+                    final_base_ingredients.remove(rule.ingredient_id)
+                    removed.append(rule.ingredient_id)
+            elif rule.action == ModifierAction.REPLACE:
+                if rule.replace_ingredient_id:
+                    while rule.replace_ingredient_id in final_base_ingredients:
+                        final_base_ingredients.remove(rule.replace_ingredient_id)
+                        replaced.append(rule.replace_ingredient_id)
+                if rule.ingredient_id not in final_base_ingredients:
+                    final_base_ingredients.append(rule.ingredient_id)
+                    added.append(rule.ingredient_id)
+
         matched_rules.append(
             MappingRuleTrace(
-                rule=rule["name"],
+                rule=f"{rule.modifier_name}={rule.option_value}",
                 matched=matched,
                 added_skus=added,
-                details={"priority": str(rule["priority"])}
-                if matched
-                else {"priority": str(rule["priority"])},
+                removed_skus=removed,
+                replaced_skus=replaced,
+                details={"action": rule.action.value, "ingredient_id": rule.ingredient_id},
             )
         )
 
-    return ItemMappingTrace(
+    trace = ItemMappingTrace(
         item_id=cart_item.item_id,
         base_ingredients=base_ingredients,
         matched_rules=matched_rules,
         final_base_ingredients=final_base_ingredients,
     )
+    return trace, None
+
+
+def taxonomy_state(ingredient: Ingredient, allergen: Allergen, profile: Dict[Allergen, AllergenState]) -> AllergenState:
+    """Trusted taxonomy defaults missing allergens to NOT_PRESENT; else UNKNOWN."""
+    default_state = AllergenState.NOT_PRESENT if ingredient.taxonomy_trusted else AllergenState.UNKNOWN
+    return profile.get(allergen, default_state)
+
+
+def expand_ingredient_ids(base_ids: List[str]) -> Tuple[List[str], List[CompositionRuleTrace], List[Tuple[str, str]], bool]:
+    """
+    Expand composite ingredients into leaf ingredients with cycle detection.
+    Returns (expanded_leaf_ids, composition_trace, leaf_to_base_pairs, cycle_detected).
+    """
+    expanded: List[str] = []
+    composition_trace: List[CompositionRuleTrace] = []
+    leaf_sources: List[Tuple[str, str]] = []
+    cycle_detected = False
+
+    def dfs(current: str, origin_base: str, depth: int, path: List[str]) -> bool:
+        nonlocal cycle_detected
+        if current in path:
+            cycle_detected = True
+            composition_trace.append(
+                CompositionRuleTrace(
+                    parent_ingredient_id=current,
+                    expanded_to=[],
+                    depth=depth,
+                    cycle_detected=True,
+                    details={"path": "->".join(path + [current])},
+                )
+            )
+            return True
+
+        comp = ingredient_composition_store.get(current)
+        if not comp:
+            if current not in expanded:
+                expanded.append(current)
+                leaf_sources.append((current, origin_base))
+            return False
+
+        path.append(current)
+        before = list(expanded)
+        local_cycle = False
+        for line in comp.components:
+            if dfs(line.ingredient_id, origin_base, depth + 1, path):
+                local_cycle = True
+        added = [leaf for leaf in expanded if leaf not in before]
+        composition_trace.append(
+            CompositionRuleTrace(
+                parent_ingredient_id=current,
+                expanded_to=added,
+                depth=depth,
+                cycle_detected=local_cycle,
+                details={"component_count": str(len(comp.components))},
+            )
+        )
+        path.pop()
+        cycle_detected = cycle_detected or local_cycle
+        return local_cycle
+
+    for base in base_ids:
+        dfs(base, base, depth=0, path=[])
+
+    return expanded, composition_trace, leaf_sources, cycle_detected
+
+
+# Debug helper for composition expansion when requested via env.
+def _debug_expansion():
+    if os.getenv("DEBUG_EXPANSION") != "1":
+        return
+    expanded, trace, leaf_sources, cycle = expand_ingredient_ids(["TORTILLA_FLOUR"])
+    print("[DEBUG] Expansion for TORTILLA_FLOUR ->", expanded, "cycle:", cycle, "sources:", leaf_sources)
+    for t in trace:
+        print("[DEBUG] trace", t)
+
+
+# Seed demo data on startup.
+seed_data()
+_debug_expansion()
 
 
 def is_stale_timestamp(ts: Optional[datetime]) -> bool:
@@ -984,7 +1342,64 @@ def get_distributor_product(sku: str = Path(..., description="SKU identifier")):
 
 @app.get("/v1/menu", response_model=List[MenuItem])
 def get_menu():
-    return menu_items
+    return list(menu_store.values())
+
+
+@app.post("/v1/integrations/toast/menu/import")
+def import_toast_menu(payload: ToastMenuImportRequest):
+    menu_store.clear()
+    for item in payload.items:
+        menu_store[item.item_id] = item
+    record_import("menu")
+    return {"ok": True, "menu_count": len(menu_store)}
+
+
+@app.post("/v1/integrations/xtrachef/ingredients/import")
+def import_xtrachef_ingredients(payload: XtraChefIngredientsImportRequest):
+    ingredient_store.clear()
+    vendor_product_store.clear()
+    for ing in payload.ingredients:
+        ingredient_store[ing.ingredient_id] = ing
+    for vp in payload.vendor_products:
+        vendor_product_store[vp.vendor_product_id] = vp
+    record_import("ingredients")
+    record_import("vendor_products")
+    return {
+        "ok": True,
+        "ingredient_count": len(ingredient_store),
+        "vendor_product_count": len(vendor_product_store),
+    }
+
+
+@app.post("/v1/integrations/xtrachef/recipes/import")
+def import_xtrachef_recipes(payload: XtraChefRecipesImportRequest):
+    recipe_store.clear()
+    for recipe in payload.recipes:
+        recipe_store[recipe.menu_item_id] = recipe
+    record_import("recipes")
+    return {"ok": True, "recipe_count": len(recipe_store)}
+
+
+@app.post("/v1/integrations/xtrachef/ingredient-compositions/import")
+def import_xtrachef_ingredient_compositions(payload: XtraChefIngredientCompositionsImportRequest):
+    ingredient_composition_store.clear()
+    for comp in payload.compositions:
+        ingredient_composition_store[comp.parent_ingredient_id] = comp
+    record_import("ingredient_compositions")
+    return {"ok": True, "composition_count": len(ingredient_composition_store)}
+
+
+@app.get("/v1/integrations/status", response_model=IntegrationStatusResponse)
+def integrations_status():
+    return IntegrationStatusResponse(
+        menu_count=len(menu_store),
+        recipe_count=len(recipe_store),
+        ingredient_count=len(ingredient_store),
+        vendor_product_count=len(vendor_product_store),
+        modifier_rule_count=len(modifier_rule_store),
+        composition_count=len(ingredient_composition_store),
+        last_imports=last_imported,
+    )
 
 
 @app.get("/v1/providers")
@@ -1038,6 +1453,29 @@ def get_supplier_truth(gtin: str, lot: str):
     return truth
 
 
+@app.get("/v1/ingredients/{ingredient_id}", response_model=IngredientDetailResponse)
+def get_ingredient_detail(ingredient_id: str):
+    ingredient = ingredient_store.get(ingredient_id)
+    if not ingredient:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ingredient not found")
+    composition = ingredient_composition_store.get(ingredient_id)
+    expanded = None
+    trace = None
+    if composition:
+        expanded, trace, _, _ = expand_ingredient_ids([ingredient_id])
+    return IngredientDetailResponse(
+        ingredient=ingredient,
+        composition=composition,
+        expanded_leaves=expanded,
+        composition_trace=trace,
+    )
+
+
+@app.get("/v1/health")
+def health():
+    return {"ok": True, "time": utcnow().isoformat()}
+
+
 @app.post("/v1/inventory/scan", response_model=InventoryScanResponse)
 def inventory_scan(request: InventoryScanRequest):
     active = link_active_product(request.location_id, request.base_ingredient_id, request.gtin, request.lot)
@@ -1060,7 +1498,8 @@ def summarize(decision: VerificationDecision, reasons: List[Reason]) -> str:
     if decision == VerificationDecision.SAFE:
         return "SAFE — this dish does not contain declared allergens."
     if decision == VerificationDecision.UNSAFE and reasons:
-        return f"UNSAFE — {reasons[0].explanation}"
+        first_contains = next((r for r in reasons if r.state == AllergenState.CONTAINS), reasons[0])
+        return f"UNSAFE — {first_contains.explanation}"
     return "UNKNOWN — cannot guarantee safety due to stale or missing ingredient data."
 
 
@@ -1073,6 +1512,7 @@ def verify(request: VerifyRequest):
     mapping_traces: List[ItemMappingTrace] = []
     ingredient_versions: Dict[str, str] = {}
     base_ingredients_used: Dict[str, List[str]] = {}
+    expanded_ingredients_used: Dict[str, List[str]] = {}
     active_product_links: Dict[str, Dict[str, str]] = {}
 
     decision = VerificationDecision.SAFE
@@ -1080,16 +1520,68 @@ def verify(request: VerifyRequest):
     for item in request.cart:
         menu_item = get_menu_item(item.item_id)
         if not menu_item:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown menu item {item.item_id}")
+            trace = ItemMappingTrace(item_id=item.item_id, base_ingredients=[], matched_rules=[], final_base_ingredients=[])
+            mapping_traces.append(trace)
+            base_ingredients_used[item.item_id] = []
+            expanded_ingredients_used[item.item_id] = []
+            active_product_links[item.item_id] = {}
+            if decision != VerificationDecision.UNSAFE:
+                decision = VerificationDecision.UNKNOWN
+            reasons.append(
+                Reason(
+                    allergen=request.allergies[0] if request.allergies else Allergen.WHEAT,
+                    ingredient_sku=item.item_id,
+                    ingredient_name=item.item_id,
+                    state=AllergenState.UNKNOWN,
+                    explanation=f"Unknown — menu item {item.item_id} not found in menu store.",
+                )
+            )
+            continue
 
-        trace = resolve_recipe(item)
+        trace, mapping_issue = resolve_recipe_from_stores(item)
         mapping_traces.append(trace)
         base_ingredients_used[item.item_id] = trace.final_base_ingredients
         active_product_links[item.item_id] = {}
 
+        if mapping_issue:
+            expanded_ingredients_used[item.item_id] = []
+            if decision != VerificationDecision.UNSAFE:
+                decision = VerificationDecision.UNKNOWN
+            reasons.append(
+                Reason(
+                    allergen=request.allergies[0] if request.allergies else Allergen.WHEAT,
+                    ingredient_sku=item.item_id,
+                    ingredient_name=item.item_id,
+                    state=AllergenState.UNKNOWN,
+                    explanation=f"Unknown — {mapping_issue} for menu item {item.item_id}.",
+                )
+            )
+            continue
+
+        expanded_leaves, comp_trace, leaf_sources, cycle_found = expand_ingredient_ids(trace.final_base_ingredients)
+        trace.expanded_ingredients = expanded_leaves
+        trace.composition_trace = comp_trace
+        expanded_ingredients_used[item.item_id] = expanded_leaves
+
+        if cycle_found:
+            if decision != VerificationDecision.UNSAFE:
+                decision = VerificationDecision.UNKNOWN
+            reasons.append(
+                Reason(
+                    allergen=request.allergies[0] if request.allergies else Allergen.WHEAT,
+                    ingredient_sku=item.item_id,
+                    ingredient_name=item.item_id,
+                    state=AllergenState.UNKNOWN,
+                    explanation="Unknown — ingredient composition cycle detected.",
+                )
+            )
+
+        base_profiles: Dict[str, Dict[str, object]] = {}
+
         for base_id in trace.final_base_ingredients:
             active = get_active_product(request.location_id, base_id)
             if not active:
+                base_profiles[base_id] = {"source": "no_active"}
                 if decision != VerificationDecision.UNSAFE:
                     decision = VerificationDecision.UNKNOWN
                 reasons.append(
@@ -1105,6 +1597,7 @@ def verify(request: VerifyRequest):
 
             truth = lookup_supplier_truth(active["gtin"], active["lot"])
             if not truth:
+                base_profiles[base_id] = {"source": "missing_truth"}
                 if decision != VerificationDecision.UNSAFE:
                     decision = VerificationDecision.UNKNOWN
                 reasons.append(
@@ -1127,6 +1620,7 @@ def verify(request: VerifyRequest):
             active_product_links[item.item_id][base_id] = f"gtin={truth.gtin}, lot={truth.lot}"
 
             if not allergen_profile:
+                base_profiles[base_id] = {"source": "missing_profile", "truth": truth, "provider": provider_name, "provider_fetched_at": provider_fetched_at}
                 if decision != VerificationDecision.UNSAFE:
                     decision = VerificationDecision.UNKNOWN
                 reasons.append(
@@ -1143,6 +1637,7 @@ def verify(request: VerifyRequest):
                 continue
 
             if is_stale_timestamp(data_updated_at):
+                base_profiles[base_id] = {"source": "stale", "truth": truth, "provider": provider_name, "provider_fetched_at": provider_fetched_at}
                 if decision != VerificationDecision.UNSAFE:
                     decision = VerificationDecision.UNKNOWN
                 stale_expl = (
@@ -1164,6 +1659,7 @@ def verify(request: VerifyRequest):
                 continue
 
             if truth.recall:
+                base_profiles[base_id] = {"source": "recall", "truth": truth, "provider": provider_name, "provider_fetched_at": provider_fetched_at}
                 decision = VerificationDecision.UNSAFE
                 reasons.append(
                     Reason(
@@ -1178,18 +1674,61 @@ def verify(request: VerifyRequest):
                 )
                 continue
 
+            base_profiles[base_id] = {
+                "source": "supplier",
+                "profile": allergen_profile,
+                "provider": provider_name,
+                "provider_fetched_at": provider_fetched_at,
+                "truth": truth,
+            }
+
+        for leaf_id, source_base in leaf_sources:
+            profile = None
+            provider_name: Optional[str] = None
+            provider_fetched_at: Optional[datetime] = None
+            ingredient_sku = leaf_id
+            ingredient_name = leaf_id
+            ingredient = ingredient_store.get(leaf_id)
+
+            default_profile = ingredient.default_allergens if ingredient else None
+            if default_profile is not None:
+                profile = default_profile
+                provider_name = "INGREDIENT_TAXONOMY"
+                provider_fetched_at = None
+                ingredient_name = ingredient.name if ingredient else leaf_id
+
+            if profile is None:
+                if decision != VerificationDecision.UNSAFE:
+                    decision = VerificationDecision.UNKNOWN
+                for allergen in request.allergies:
+                    reasons.append(
+                        Reason(
+                            allergen=allergen,
+                            ingredient_sku=ingredient_sku,
+                            ingredient_name=ingredient_name,
+                            state=AllergenState.UNKNOWN,
+                            explanation=f"Unknown — no allergen data for ingredient {leaf_id} derived from {source_base}.",
+                            provider=provider_name,
+                            provider_fetched_at=provider_fetched_at,
+                        )
+                    )
+                continue
+
             for allergen in request.allergies:
-                state = allergen_profile.get(allergen, AllergenState.UNKNOWN)
+                if provider_name == "INGREDIENT_TAXONOMY" and ingredient:
+                    state = taxonomy_state(ingredient, allergen, profile)
+                else:
+                    state = AllergenState.UNKNOWN if profile is None else profile.get(allergen, AllergenState.UNKNOWN)
                 if state == AllergenState.CONTAINS:
                     decision = VerificationDecision.UNSAFE
                     reasons.append(
                         Reason(
                             allergen=allergen,
-                            ingredient_sku=truth.gtin,
-                            ingredient_name=truth.name,
+                            ingredient_sku=ingredient_sku,
+                            ingredient_name=ingredient_name,
                             state=state,
-                            explanation=f"Unsafe — base ingredient {base_id} lot {truth.lot} (GTIN {truth.gtin}) contains {allergen}.",
-                            provider=str(provider_name),
+                            explanation=f"Unsafe — ingredient {leaf_id} derived from {source_base} contains {allergen}.",
+                            provider=provider_name,
                             provider_fetched_at=provider_fetched_at,
                         )
                     )
@@ -1201,11 +1740,11 @@ def verify(request: VerifyRequest):
                         reasons.append(
                             Reason(
                                 allergen=allergen,
-                                ingredient_sku=truth.gtin,
-                                ingredient_name=truth.name,
+                                ingredient_sku=ingredient_sku,
+                                ingredient_name=ingredient_name,
                                 state=state,
-                                explanation=f"Unsafe — policy marks MAY_CONTAIN as unsafe for {base_id}.",
-                                provider=str(provider_name),
+                                explanation=f"Unsafe — policy marks MAY_CONTAIN as unsafe for ingredient {leaf_id}.",
+                                provider=provider_name,
                                 provider_fetched_at=provider_fetched_at,
                             )
                         )
@@ -1215,11 +1754,11 @@ def verify(request: VerifyRequest):
                         reasons.append(
                             Reason(
                                 allergen=allergen,
-                                ingredient_sku=truth.gtin,
-                                ingredient_name=truth.name,
+                                ingredient_sku=ingredient_sku,
+                                ingredient_name=ingredient_name,
                                 state=state,
-                                explanation=f"Unknown — {base_id} lot {truth.lot} may contain {allergen}; policy allows but cannot guarantee.",
-                                provider=str(provider_name),
+                                explanation=f"Unknown — ingredient {leaf_id} may contain {allergen}; policy allows but cannot guarantee.",
+                                provider=provider_name,
                                 provider_fetched_at=provider_fetched_at,
                             )
                         )
@@ -1231,11 +1770,11 @@ def verify(request: VerifyRequest):
                     reasons.append(
                         Reason(
                             allergen=allergen,
-                            ingredient_sku=truth.gtin,
-                            ingredient_name=truth.name,
+                            ingredient_sku=ingredient_sku,
+                            ingredient_name=ingredient_name,
                             state=state,
-                            explanation=f"Unknown — allergen presence unknown for base ingredient {base_id} lot {truth.lot}.",
-                            provider=str(provider_name),
+                            explanation=f"Unknown — allergen presence unknown for ingredient {leaf_id} derived from {source_base}.",
+                            provider=provider_name,
                             provider_fetched_at=provider_fetched_at,
                         )
                     )
@@ -1257,6 +1796,7 @@ def verify(request: VerifyRequest):
         mapping_trace=mapping_traces,
         ingredient_versions_used=ingredient_versions,
         base_ingredients_used=base_ingredients_used,
+        expanded_ingredients_used=expanded_ingredients_used,
         active_product_links=active_product_links,
         cart_hash=cart_hash(json.loads(request.json())),
         policy={
@@ -1282,6 +1822,7 @@ def verify(request: VerifyRequest):
         audit_id=audit_id,
         checkout_token=token,
         token_expires_at=token_expires_at,
+        mapping_trace=mapping_traces,
     )
 
 
